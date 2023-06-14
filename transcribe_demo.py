@@ -1,151 +1,164 @@
-#! python3.7
+#!/usr/bin/env python
 
 import argparse
-import io
+import asyncio
+from datetime import datetime, timedelta
+import numpy as np
 import os
 import speech_recognition as sr
-import whisper
+import sys
 import torch
+import whisper
 
-from datetime import datetime, timedelta
-from queue import Queue
-from tempfile import NamedTemporaryFile
-from time import sleep
-from sys import platform
-
-
-def main():
+def get_arg_parser():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model", default="medium", help="Model to use",
+    parser.add_argument("--model", default="small", help="Model to use",
                         choices=["tiny", "base", "small", "medium", "large"])
     parser.add_argument("--non_english", action='store_true',
                         help="Don't use the english model.")
+    parser.add_argument("--task", type=str, default="transcribe", choices=[
+                        "transcribe", "translate"], help="whether to perform X->X speech recognition ('transcribe') or X->English translation ('translate')")
+    parser.add_argument("--language", type=str, default=None, choices=sorted(whisper.tokenizer.LANGUAGES.keys()) + sorted(
+        [k.title() for k in whisper.tokenizer.TO_LANGUAGE_CODE.keys()]), help="language spoken in the audio, specify None to perform language detection")
     parser.add_argument("--energy_threshold", default=1000,
                         help="Energy level for mic to detect.", type=int)
     parser.add_argument("--record_timeout", default=2,
                         help="How real time the recording is in seconds.", type=float)
     parser.add_argument("--phrase_timeout", default=3,
                         help="How much empty space between recordings before we "
-                             "consider it a new line in the transcription.", type=float)  
-    if 'linux' in platform:
+                             "consider it a new line in the transcription.", type=float)
+    if 'linux' in sys.platform:
         parser.add_argument("--default_microphone", default='pulse',
                             help="Default microphone name for SpeechRecognition. "
                                  "Run this with 'list' to view available Microphones.", type=str)
-    args = parser.parse_args()
-    
-    # The last time a recording was retreived from the queue.
-    phrase_time = None
-    # Current raw audio bytes.
-    last_sample = bytes()
-    # Thread safe Queue for passing data from the threaded recording callback.
-    data_queue = Queue()
+    return parser
+
+
+def load_model(args):
+    # Load / Download model
+    model = args.model
+    if args.model != "large" and not args.non_english and (args.language in set([None, 'en', 'English'])):
+        model = model + ".en"
+    audio_model = whisper.load_model(
+        model, download_root=os.path.join(os.getcwd(), "models"))
+    return audio_model
+
+
+def setup_audio_src(args):
     # We use SpeechRecognizer to record our audio because it has a nice feauture where it can detect when speech ends.
     recorder = sr.Recognizer()
     recorder.energy_threshold = args.energy_threshold
     # Definitely do this, dynamic energy compensation lowers the energy threshold dramtically to a point where the SpeechRecognizer never stops recording.
     recorder.dynamic_energy_threshold = False
-    
-    # Important for linux users. 
+
+    # Important for linux users.
     # Prevents permanent application hang and crash by using the wrong Microphone
-    if 'linux' in platform:
+    if 'linux' in sys.platform:
         mic_name = args.default_microphone
         if not mic_name or mic_name == 'list':
             print("Available microphone devices are: ")
             for index, name in enumerate(sr.Microphone.list_microphone_names()):
-                print(f"Microphone with name \"{name}\" found")   
+                print(f"Microphone with name \"{name}\" found")
             return
         else:
             for index, name in enumerate(sr.Microphone.list_microphone_names()):
                 if mic_name in name:
-                    source = sr.Microphone(sample_rate=16000, device_index=index)
+                    source = sr.Microphone(
+                        sample_rate=16000, device_index=index)
                     break
     else:
         source = sr.Microphone(sample_rate=16000)
-        
-    # Load / Download model
-    model = args.model
-    if args.model != "large" and not args.non_english:
-        model = model + ".en"
-    audio_model = whisper.load_model(model)
 
-    record_timeout = args.record_timeout
-    phrase_timeout = args.phrase_timeout
-
-    temp_file = NamedTemporaryFile().name
-    transcription = ['']
-    
     with source:
         recorder.adjust_for_ambient_noise(source)
 
-    def record_callback(_, audio:sr.AudioData) -> None:
-        """
-        Threaded callback function to recieve audio data when recordings finish.
-        audio: An AudioData containing the recorded bytes.
-        """
-        # Grab the raw bytes and push it into the thread safe queue.
-        data = audio.get_raw_data()
-        data_queue.put(data)
+    return source, recorder
 
-    # Create a background thread that will pass us raw audio bytes.
-    # We could do this manually but SpeechRecognizer provides a nice helper.
-    recorder.listen_in_background(source, record_callback, phrase_time_limit=record_timeout)
+
+async def input_stream_generator(async_state):
+    # Thread safe Queue for passing data from the threaded recording callback.
+    data_queue = asyncio.Queue()
+    loop = asyncio.get_event_loop()
+
+    def record_callback(_, audio: sr.AudioData) -> None:
+        wav_data = audio.get_wav_data()
+        loop.call_soon_threadsafe(data_queue.put_nowait,
+                                  np.frombuffer(wav_data, dtype=async_state.raw_datatype, count=len(wav_data)//2, offset=0).astype(np.float32, order='C') / 32768.0)
+
+    async_state.recorder.listen_in_background(
+        async_state.source, record_callback, phrase_time_limit=async_state.record_timeout)
+    while True:
+        sample = await data_queue.get()
+        yield sample
+
+
+class AsyncState(object):
+    def __init__(self, phrase_timeout, record_timeout, task="transcribe", language=None, raw_datatype=np.int16):
+        # Setup an object to track our state in
+        self.phrase_time = datetime.utcnow()
+        self.phrase_timeout = phrase_timeout
+        self.record_timeout = record_timeout
+        self.global_buffer = np.array([])
+        self.fp16 = torch.cuda.is_available()
+        self.raw_datatype = raw_datatype
+        self.transcription = ['']
+        self.task = task
+        self.language = language
+        self.audio_model = None
+        self.source = None
+        self.recorder = None
+
+
+async def process_audio_buffer(async_state):
+    async for last_sample in input_stream_generator(async_state):
+        now = datetime.utcnow()
+        phrase_complete = False
+        if now - async_state.phrase_time > timedelta(seconds=async_state.phrase_timeout):
+            async_state.global_buffer = np.array([], dtype=np.int16)
+            phrase_complete = True
+        async_state.phrase_time = now
+        async_state.global_buffer = np.concatenate(
+            (async_state.global_buffer, last_sample))
+        # Read the transcription.
+        result = async_state.audio_model.transcribe(
+            async_state.global_buffer, fp16=async_state.fp16, task=async_state.task)
+        text = result['text'].strip()
+        # If we detected a pause between recordings, add a new item to our transcripion.
+        # Otherwise edit the existing one.
+        if phrase_complete:
+            async_state.transcription.append(text)
+        else:
+            async_state.transcription[-1] = text
+        # Clear the console to reprint the updated transcription.
+        os.system('cls' if os.name == 'nt' else 'clear')
+        for line in async_state.transcription:
+            print(line)
+        # Flush stdout.
+        print('', end='', flush=True)
+
+
+async def async_main(async_state):
+    audio_task = asyncio.create_task(process_audio_buffer(async_state))
+    while True:
+        await asyncio.sleep(1)
+
+def main():
+    args = get_arg_parser().parse_args()
+    async_state = AsyncState(
+        args.phrase_timeout, args.record_timeout, args.task, args.language)
+    async_state.audio_model = load_model(args)
+    async_state.source, async_state.recorder = setup_audio_src(args)
 
     # Cue the user that we're ready to go.
-    print("Model loaded.\n")
+    print("\nModel loaded.\n")
 
-    while True:
-        try:
-            now = datetime.utcnow()
-            # Pull raw recorded audio from the queue.
-            if not data_queue.empty():
-                phrase_complete = False
-                # If enough time has passed between recordings, consider the phrase complete.
-                # Clear the current working audio buffer to start over with the new data.
-                if phrase_time and now - phrase_time > timedelta(seconds=phrase_timeout):
-                    last_sample = bytes()
-                    phrase_complete = True
-                # This is the last time we received new audio data from the queue.
-                phrase_time = now
-
-                # Concatenate our current audio data with the latest audio data.
-                while not data_queue.empty():
-                    data = data_queue.get()
-                    last_sample += data
-
-                # Use AudioData to convert the raw data to wav data.
-                audio_data = sr.AudioData(last_sample, source.SAMPLE_RATE, source.SAMPLE_WIDTH)
-                wav_data = io.BytesIO(audio_data.get_wav_data())
-
-                # Write wav data to the temporary file as bytes.
-                with open(temp_file, 'w+b') as f:
-                    f.write(wav_data.read())
-
-                # Read the transcription.
-                result = audio_model.transcribe(temp_file, fp16=torch.cuda.is_available())
-                text = result['text'].strip()
-
-                # If we detected a pause between recordings, add a new item to our transcripion.
-                # Otherwise edit the existing one.
-                if phrase_complete:
-                    transcription.append(text)
-                else:
-                    transcription[-1] = text
-
-                # Clear the console to reprint the updated transcription.
-                os.system('cls' if os.name=='nt' else 'clear')
-                for line in transcription:
-                    print(line)
-                # Flush stdout.
-                print('', end='', flush=True)
-
-                # Infinite loops are bad for processors, must sleep.
-                sleep(0.25)
-        except KeyboardInterrupt:
-            break
-
-    print("\n\nTranscription:")
-    for line in transcription:
-        print(line)
+    try:
+        asyncio.run(async_main(async_state))
+    except KeyboardInterrupt:
+        print("\n\nTranscription:")
+        for line in async_state.transcription:
+            print(line)
+        sys.exit('\nInterrupted by user')
 
 
 if __name__ == "__main__":
